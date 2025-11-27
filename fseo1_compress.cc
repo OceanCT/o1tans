@@ -22,6 +22,25 @@ void O1_HIST(const void* src, size_t srcSize, unsigned* o0count, unsigned* o1cou
         o1count[prevSymbol * (maxSymbolValue + 1) + symbol]++;
         prevSymbol = symbol;
     }
+    // check if there are any symbols that only follow the exact one previous symbol
+    for(unsigned symbol = 0; symbol <= maxSymbolValue; symbol++) {
+        unsigned follow_count = 0;
+        for(unsigned prev = 0; prev <= maxSymbolValue; prev++) {
+            if(o1count[prev * (maxSymbolValue + 1) + symbol] > 0) {
+                follow_count++;
+            }
+        }
+        // if follow_count == 0, means this symbol never occurred
+        if(follow_count == 1) {
+            // find which previous symbol it follows
+            for(unsigned prev = 0; prev <= maxSymbolValue; prev++) {
+                if(o1count[prev * (maxSymbolValue + 1) + symbol] > 0) {
+                    printf("Symbol %u only follows symbol %u\n", symbol, prev);
+                    break;
+                }
+            }
+        }
+    }
 } 
 
 /*
@@ -38,11 +57,14 @@ size_t normalizeCountO0(unsigned* o0count, unsigned maxSymbolValue, int totalCou
 
     unsigned long long sum = 0;
     unsigned symbol;
-
+    unsigned o0countnum = 0;
+    for(symbol = 0; symbol <= maxSymbolValue; symbol++) {
+        o0countnum += o0count[symbol] != 0;
+    }
     for (symbol = 0; symbol <= maxSymbolValue; symbol++) {
         // Calculate: (o0count[symbol] * K) / totalCount
         // Use 64-bit arithmetic for the product to prevent potential 32-bit overflow.
-        unsigned long long scaled_count_ull = ((unsigned long long)o0count[symbol] * K) / totalCount_ull;
+        unsigned long long scaled_count_ull = ((unsigned long long)o0count[symbol] * (K - o0countnum)) / totalCount_ull;
 
         // Store the result as uint16_t (since K fits in 16 bits, the scaled count will too)
         normalizedCount[symbol] = (uint16_t)scaled_count_ull;
@@ -57,16 +79,69 @@ size_t normalizeCountO0(unsigned* o0count, unsigned maxSymbolValue, int totalCou
         }
     }
 
-    unsigned long long deficit = K - sum;
-
-    for (symbol = 0; symbol <= maxSymbolValue; symbol++) {
-        if (deficit == 0) {
-            break; 
+    int deficit = K - sum;
+    assert(deficit >= 0);
+    while(deficit > 0) {
+        for (symbol = 0; symbol <= maxSymbolValue; symbol++) {
+            if(o0count[symbol] == 0) continue;
+            if (deficit == 0) {
+                break; 
+            }
+            normalizedCount[symbol]++;
+            deficit--;
         }
-        normalizedCount[symbol]++;
-        deficit--;
+        printf("Deficit after distribution round: %llu\n", deficit);
+    }
+    // printf("O0 normalization done. Final sum: %llu (expected %llu)\n", K - deficit, K);
+    return sizeof(uint16_t) * (maxSymbolValue + 1);
+}
+
+size_t purenormalizeCountO1(unsigned* o1count, unsigned maxSymbolValue, int tablelog, uint16_t* normalized_count, char** header) {
+    // printf("Using pure O1 normalization...\n");
+    for(unsigned i = 0; i <= maxSymbolValue; i++) {
+        normalized_count[i] = 0;
+    }
+    const unsigned N = 1U << tablelog;
+    const size_t numSymbols = maxSymbolValue + 1;
+    unsigned i;
+
+    unsigned totalO1Count = 0;
+    unsigned o1symbolnum = 0;
+    for (i = 0; i < numSymbols; i++) {
+        totalO1Count += o1count[i];
+        if(o1count[i]) o1symbolnum++;
     }
 
+    unsigned norm_total = 0;
+    const unsigned N1 = N - o1symbolnum; // reserve at least 1 count for each symbol
+    for (i = 0; i < numSymbols; i++) {
+        if(o1count[i] == 0) continue;
+        unsigned raw_count = o1count[i];
+        unsigned norm_count = (unsigned)(raw_count * N1 / totalO1Count);
+        if(norm_count == 0) norm_count++;
+        normalized_count[i] = (uint16_t)norm_count;
+        norm_total += norm_count;
+    }
+
+    int deficit = N - norm_total;
+    assert(deficit >= 0);
+    while(deficit > 0) {
+        for (unsigned symbol = 0; symbol <= maxSymbolValue; symbol++) {
+            if (deficit == 0) {
+                break; 
+            }
+            if(o1count[symbol] == 0) continue;
+            normalized_count[symbol]++;
+            deficit--;
+        }
+    }
+    // write header indicating pure o1 usage
+    *header = (char*)malloc(sizeof(uint16_t) * (maxSymbolValue + 1));
+    // write normalized count into header
+    for(unsigned s = 0; s <= maxSymbolValue; s++) {
+        (*header)[2 * s] = normalized_count[s] & 0xFFFF;
+        (*header)[2 * s + 1] = (normalized_count[s] >> 16) & 0xFFFF;
+    }
     return sizeof(uint16_t) * (maxSymbolValue + 1);
 }
 
@@ -83,7 +158,11 @@ size_t normalizeCountO0(unsigned* o0count, unsigned maxSymbolValue, int totalCou
 // otherwise set the record way flag to 1
 // notice we never fall back to only use o0 count unless all symbols' occurrence are below the cap
 // return the size of header 
-size_t normalizeCountO1(unsigned* o0count, unsigned* o1count, unsigned maxSymbolValue, float o1numcap, int o0totalCount, int tablelog, uint16_t* normalized_count, unsigned** header) {
+size_t normalizeCountO1(unsigned* o0count, unsigned* o1count, unsigned maxSymbolValue, float o1numcap, int o0totalCount, int tablelog, uint16_t* normalized_count, char** header) {
+    // printf("Normalizing O1 counts with o1numcap=%f...\n", o1numcap);
+    if(o1numcap == 0) {
+        return purenormalizeCountO1(o1count, maxSymbolValue, tablelog, normalized_count, header);
+    }
     for(unsigned i = 0; i <= maxSymbolValue; i++) {
         normalized_count[i] = 0;
     }
@@ -97,12 +176,12 @@ size_t normalizeCountO1(unsigned* o0count, unsigned* o1count, unsigned maxSymbol
     for (i = 0; i < numSymbols; i++) {
         o1_full_totalCount += o1count[i];
     }
+    // printf("O1 full total count: %d\n", o1_full_totalCount);
     
     // The threshold is the cap * totalCount of current o1 table.
     const unsigned threshold = (o1_full_totalCount > 0)
-                             ? (unsigned)round(o1numcap * (double)o1_full_totalCount)
+                             ? (unsigned)(o1numcap * o1_full_totalCount)
                              : 0;
-    printf("O1 normalization threshold (raw count): %u\n", threshold);
     // --- Pass 1: Identify and Sum O1 Candidates ---
     // Store indices and counts of symbols that will use the O1 model
     // Using 2 uint16_t (4 bytes) per candidate: symbol index (uint16_t) and raw count (uint16_t).
@@ -113,8 +192,10 @@ size_t normalizeCountO1(unsigned* o0count, unsigned* o1count, unsigned maxSymbol
     }
     unsigned o1_candidates_count = 0;
     unsigned o0_remaining_total = 0;
+    unsigned o0_count_num = 0;
     uint8_t o1_candidates[maxSymbolValue] = {0};
     
+    // printf("Identifying O1 candidates with threshold: %u...\n", threshold);
     for (i = 0; i < numSymbols; i++) {
         if (o1count[i] >= threshold) {
             // Store symbol index and raw count
@@ -124,23 +205,14 @@ size_t normalizeCountO1(unsigned* o0count, unsigned* o1count, unsigned maxSymbol
             o1_candidates[i] = 1; // mark as O1 candidate
         } else {
             o0_remaining_total += o0count[i];
+            if(o0count[i]) o0_count_num++;
         }
     }
-    // print o1 candidates 
-    // for(i = 0; i < o1_candidates_count; i++) {
-        // unsigned symbol = o1_candidates_data[i * 2];
-        // unsigned raw_count = o1_candidates_data[i * 2 + 1];
-        // printf("O1 Candidate Symbol: %u, Raw Count: %u\n", symbol, raw_count);
+    // if(o1_candidates_count == 0) {
+    //     printf("No O1 candidates identified. Falling back to pure O1 normalization.\n");
+    //     return purenormalizeCountO1(o1count, maxSymbolValue, tablelog, normalized_count, header);
     // }
-    // int o1_tmp_cnt = 0;
-    // for(i = 0; i < numSymbols; i++) {
-        // printf("Symbol: %u, O0 Count: %u, O1 Count: %u, threshold: %u, o1_tmp_cnt: %d\n", i, o0count[i], o1count[i], threshold, o1_tmp_cnt);
-    //     o1_tmp_cnt += o1count[i];
-    // }
-    // --- Pass 2: Calculate O1 Normalized Counts and Build Sparse Header Buffer (Draft) ---
-    
-    // Max compact header size: flag(1B) + count(1B) + maxSymbolValue * (symbol(1B) + count(2B))
-    // To handle byte packing, we will use a byte array for the draft header.
+    // printf("Identified %u O1 candidates out of %zu symbols.\n", o1_candidates_count, numSymbols);
     const size_t max_sparse_header_bytes = 2 + numSymbols * 3;
     uint8_t* sparse_header_draft = (uint8_t*)malloc(max_sparse_header_bytes);
     if (sparse_header_draft == NULL) {
@@ -150,41 +222,29 @@ size_t normalizeCountO1(unsigned* o0count, unsigned* o1count, unsigned maxSymbol
     }
     size_t header_offset = 2; // Reserve 2 bytes for [record way][record symbol num]
     unsigned o1_norm_total = 0;
-
-    for (i = 0; i < o1_candidates_count; i++) {
-        unsigned symbol = o1_candidates_data[i * 2];
-        unsigned raw_count = o1_candidates_data[i * 2 + 1];
-
+    // printf("Normalizing O1 counts for %u candidates..., o1_full_totalCount: %d\n", o1_candidates_count, o1_full_totalCount);
+    int N1 = N - o1_candidates_count - o0_count_num; // reserve at least 1 count for each symbol
+    // printf("N1: %d, N: %d, o1_candidates_count: %d, o0_count_num: %d\n", N1, N, o1_candidates_count, o0_count_num);
+    for (unsigned symbol = 0; symbol <= maxSymbolValue; symbol++) {
+        if(!o1_candidates[symbol]) continue;
+        unsigned raw_count = o1count[symbol];
         // Normalize O1 count (scaled by N)
         // Use 64-bit math for precision before dividing
         // Rounding to nearest integer
-        unsigned norm_count = (unsigned)(raw_count * N / o1_full_totalCount);
-    
+        unsigned norm_count = (unsigned)(raw_count * N1 / o1_full_totalCount);
+        if(norm_count == 0) norm_count++;
+        normalized_count[symbol] = (uint16_t)norm_count;
+        o1_norm_total += norm_count;
+
+        // Write symbol (one byte)
+        sparse_header_draft[header_offset++] = (uint8_t)symbol;
         
-        if (norm_count > 0) {
-            normalized_count[symbol] = (uint16_t)norm_count;
-            o1_norm_total += norm_count;
-
-            // Write symbol (one byte)
-            sparse_header_draft[header_offset++] = (uint8_t)symbol;
-            
-            // Write normalized count (two bytes, Little Endian assumed for simplicity)
-            // Assuming uint16_t storage: low byte, high byte
-            sparse_header_draft[header_offset++] = (uint8_t)(norm_count & 0xFF);
-            sparse_header_draft[header_offset++] = (uint8_t)((norm_count >> 8) & 0xFF);
-        } else {
-            normalized_count[symbol] = 1; 
-            o1_norm_total += 1;
-            // Write symbol (one byte)
-            sparse_header_draft[header_offset++] = (uint8_t)symbol;
-            // Write normalized count (two bytes, Little Endian assumed for simplicity)
-            sparse_header_draft[header_offset++] = 1 & 0xFF;
-            sparse_header_draft[header_offset++] = (1 >> 8) & 0xFF;
-        }
+        // Write normalized count (two bytes, Little Endian assumed for simplicity)
+        // Assuming uint16_t storage: low byte, high byte
+        sparse_header_draft[header_offset++] = (uint8_t)(norm_count & 0xFF);
+        sparse_header_draft[header_offset++] = (uint8_t)((norm_count >> 8) & 0xFF);
     }
-    
-    
-
+    // printf("o1_norm_total after O1 normalization: %u\n", o1_norm_total);
     
     // Set the number of recorded symbols
     unsigned o1_symbols_written = (header_offset - 2) / 3;
@@ -192,28 +252,19 @@ size_t normalizeCountO1(unsigned* o0count, unsigned* o1count, unsigned maxSymbol
     
     // --- Pass 3: O0 Fallback Distribution (for remaining slots) ---
     // printf("O1 normalization done. O1 normalized total: %u. Distributing remaining slots using O0 counts...\n", o1_norm_total);
-    unsigned remaining_slots = N - o1_norm_total;
-    // printf("N: %d, o1_norm_total: %d, accumulate count: %d\n", N, o1_norm_total, std::accumulate(normalized_count, normalized_count + numSymbols, 0u));
-    // Note: current_total (o1_norm_total) is implicitly used via remaining_slots
+    int remaining_slots = N - o1_norm_total;
 
-    // remaining slots should be able to fill all used o0 counts 
-    // printf("Remaining slots before O0 distribution: %u\n", remaining_slots);
-    // printf("O0 remaining total count: %u\n", o0_remaining_total);
-    // Distribute remaining slots using O0 counts for non-O1 symbols
+    printf("Distributing remaining slots (%d) using O0 counts (total O0 count: %u)...\n", remaining_slots, o0_remaining_total);
+
     if (remaining_slots > 0 && o0_remaining_total > 0) {
-        unsigned deficit = remaining_slots;
-        // check all used normalized o0 count 
-        for(unsigned symbol = 0; symbol <= maxSymbolValue; symbol++) {
-            if(o0count[symbol] > 0 && normalized_count[symbol] == 0) {
-                normalized_count[symbol] = 1;
-                deficit--;
-            }
-        }
-    
+        assert(remaining_slots >= o0_count_num);
+
+        int deficit = remaining_slots;
         // Simple proportional distribution
         for (i = 0; i < numSymbols; i++) {
             if(o1_candidates[i]) continue; // skip those symbols already used in o1 table
-            uint16_t norm_count = (uint16_t)(o0count[i] * remaining_slots / o0_remaining_total);
+            if(o0count[i] == 0) continue;
+            uint16_t norm_count = (unsigned long long)o0count[i] * (remaining_slots - o0_count_num) / o0_remaining_total;
 
             if (norm_count > 0) {
                 // Check against remaining deficit
@@ -221,75 +272,54 @@ size_t normalizeCountO1(unsigned* o0count, unsigned* o1count, unsigned maxSymbol
                     norm_count = deficit;
                 }
                 normalized_count[i] = norm_count;
-                deficit -= norm_count - 1;
-            }
-        }
-
-        assert(deficit >= 0);
-        // Final correction for rounding error: distribute any remaining deficit (should be small)
-        if (deficit > 0) {
-            // Find the symbol with the largest O0 count that was NOT used in O1
-            unsigned max_o0_symbol = 0;
-            unsigned max_o0_count = 0;
-            // First loop to find the best candidate for the deficit
-            for (i = 0; i < numSymbols; i++) {
-                 // Check if the symbol used O0-based count (o1count[i] <= threshold)
-                 if (o1count[i] <= threshold && o0count[i] > max_o0_count) {
-                    max_o0_count = o0count[i];
-                    max_o0_symbol = i;
-                 }
-            }
-            
-            // If the best O0 count candidate is not suitable or all O0 counts were zero, 
-            // find the first available slot that was intended for O0.
-            if (max_o0_count == 0) {
-                for (i = 0; i < numSymbols; i++) {
-                    // Find the first symbol that is not fully claimed by O1 (i.e., its O1 count was <= threshold)
-                    // and its normalized count is less than N
-                    if (o1count[i] <= threshold && normalized_count[i] < N) {
-                         max_o0_symbol = i;
-                         break;
-                    }
-                }
-            }
-            
-            // Add the deficit to the chosen symbol
-            if (normalized_count[max_o0_symbol] + deficit <= N) {
-                normalized_count[max_o0_symbol] += (uint16_t)deficit;
+                deficit -= norm_count;
             } else {
-                // If even the final correction overflows, distribute the remaining deficit
-                // to available symbols sequentially.
-                for (i = 0; i < numSymbols && deficit > 0; i++) {
-                     if (normalized_count[i] < UINT16_MAX) { // Check for max value
-                         unsigned increment = (deficit < (UINT16_MAX - normalized_count[i])) ? deficit : (UINT16_MAX - normalized_count[i]);
-                         normalized_count[i] += increment;
-                         deficit -= increment;
-                     }
+                normalized_count[i] = 1;
+                deficit--;
+            }
+        }
+        if(o1_candidates_count == 0) {
+            while(deficit > 0) {
+                for(unsigned long long symbol = 0; symbol <= maxSymbolValue; symbol++) {
+                    if(o1_candidates[symbol]) continue;
+                    if(deficit == 0) break;
+                    if(o0count[symbol] == 0) continue;
+                    normalized_count[symbol]++;
+                    deficit--;
                 }
             }
         }
-    } else {
-                while(remaining_slots > 0) {
-            for(int i = 0; i < o1_candidates_count; i++) {
-                unsigned symbol = o1_candidates_data[i * 2];
-                if(remaining_slots == 0) break;
-                else {
-                    normalized_count[symbol]++;
-                    remaining_slots--;
-                }
-            }
+        assert(deficit >= 0);
+        // printf("Remaining slots after O0 distribution: %llu\n", deficit);
+        remaining_slots = deficit;
+    } 
+    while(remaining_slots > 0) {
+        for(unsigned symbol = 0; symbol <= maxSymbolValue; symbol++) {
+            if(remaining_slots == 0) break;
+            if(!o1_candidates[symbol]) continue;
+            normalized_count[symbol]++;
+            remaining_slots--;
         }
     }
-    free(o1_candidates_data); // Done with intermediate data
+    
+    // printf("remaining slots number: %d\n", remaining_slots);
+
     // printf("remaining slots after O0 distribution: %d, %d\n", N - std::accumulate(normalized_count, normalized_count + numSymbols, 0u), remaining_slots);
     // if there are still remaining slots, distribute them using o0 table 
 
-
     // extra checking stage 
     for(unsigned symbol = 0; symbol <= maxSymbolValue; symbol++) {
+        if(o1count[symbol] && normalized_count[symbol] <= 0) {
+            printf("symbol: %d, o1count[%d]: %d, o1_candidates: %d, normalized: %d", symbol, symbol,
+            o1count[symbol], o1_candidates[symbol], normalized_count[symbol]);
+
+            if(o1_candidates[symbol]) assert(normalized_count[symbol] > 0);
+            else assert(normalized_count[symbol] > 0);
+        }
         if(o1count[symbol]) assert(normalized_count[symbol] > 0);
     }
-    
+    // printf("O1 normalization and O0 distribution done.\n");
+    free(o1_candidates_data); // Done with intermediate data
     // --- Pass 4: Final Header Assembly and Size Check ---
     
     // Calculate size of the dense (full) header in bytes
@@ -304,7 +334,7 @@ size_t normalizeCountO1(unsigned* o0count, unsigned* o1count, unsigned maxSymbol
         sparse_header_draft[0] = 1; // Record way flag set to 1 (sparse)
         
         // Copy the relevant part of the draft into the final header pointer
-        *header = (unsigned*)malloc(sparse_header_size);
+        *header = (char*)malloc(sparse_header_size);
         if (*header == NULL) {
              free(sparse_header_draft);
              fprintf(stderr, "Error: Memory allocation failed for final sparse header.\n");
@@ -317,7 +347,7 @@ size_t normalizeCountO1(unsigned* o0count, unsigned* o1count, unsigned maxSymbol
         // Option 2: Fall back to the dense header (just normalized_count array)
         
         // Allocate space for the full dense header
-        *header = (unsigned*)malloc(dense_header_size);
+        *header = (char*)malloc(dense_header_size);
         if (*header == NULL) {
              free(sparse_header_draft);
              fprintf(stderr, "Error: Memory allocation failed for final dense header.\n");
@@ -347,7 +377,7 @@ size_t FSEO1_Compress2(void* dst, size_t* dstSize,
     // ...
     // [N] [N] o1 table of symbol N
     // since max tablelog size is 11 bits, each counter should be able to store in 2 bytes 
-    unsigned* header = (unsigned*)malloc((maxSymbolValue + 1) * (maxSymbolValue + 2) * 2 + (maxSymbolValue + 1) * 2);
+    char* header = (char*)malloc((maxSymbolValue + 1) * (maxSymbolValue + 2) * 2 + (maxSymbolValue + 1) * 2);
     unsigned header_offset = 0;
     // output should first contain maxSymbolValue and tablelog 
     // initialize o1 and o0 histograms
@@ -356,9 +386,9 @@ size_t FSEO1_Compress2(void* dst, size_t* dstSize,
     O1_HIST(src, srcSize, o0count, o1count, maxSymbolValue, symbollength);
     // normalize o0 count
     uint16_t* o0_normalized_count = (uint16_t*)malloc(sizeof(uint16_t) * (maxSymbolValue + 1));
-    printf("Normalizing O0 counts...\n");
+    // printf("Normalizing O0 counts...\n");
     normalizeCountO0(o0count, maxSymbolValue, srcSize / symbollength, tableLog, o0_normalized_count);
-    printf("O0 normalization done.\n");
+    // printf("O0 normalization done.\n");
     // convert normalized o0 count to unsigned and write to header 
     for (int i = 0; i <= maxSymbolValue; i++) {
         header[2 * i] = o0_normalized_count[i] & 0xFF;
@@ -372,14 +402,15 @@ size_t FSEO1_Compress2(void* dst, size_t* dstSize,
     uint16_t** o1_normalized_count = (uint16_t**)malloc(sizeof(uint16_t*) * (maxSymbolValue + 1));
 
     for(int i = 0; i <= maxSymbolValue; i++) {
-        o1_use_or_not[i] = o0count[i] >= o0numcap * srcSize / symbollength;
+        o1_use_or_not[i] = o0count[i] > (o0numcap * srcSize / symbollength  + 1);
         if (o1_use_or_not[i]) {
+            printf("Symbol %d uses O1 table (o0count=%u, threshold=%f)\n", i, o0count[i], o0numcap * srcSize / symbollength);
             o1_use_cnt++;
             o1_normalized_count[i] = (uint16_t*)malloc(sizeof(uint16_t) * (maxSymbolValue + 1));
-            unsigned* new_header;
-            printf("Normalizing O1 counts for symbol %d...\n", i);
+            char* new_header;
+            // printf("Normalizing O1 counts for symbol %d...\n", i);
             size_t o1_header_size = normalizeCountO1(o0count, o1count + i * (maxSymbolValue + 1), maxSymbolValue, o1numcap, srcSize / symbollength, tableLog, o1_normalized_count[i], &new_header);
-            printf("O1 normalization for symbol %d done.\n", i);
+            // printf("O1 normalization for symbol %d done.\n", i);
             // copy new_header to header
             memcpy((unsigned char*)header + header_offset, new_header, o1_header_size);
             header_offset += o1_header_size;
@@ -431,6 +462,19 @@ size_t FSEO1_Compress2(void* dst, size_t* dstSize,
             o1_cumul[j][i] = o1_cumul[j][i - 1] + o1_normalized_count[j][i - 1];
         }
     }
+    // print o0 cumul in one line for debugging
+    printf("O0 Cumul: ");
+    for(int i = 0; i <= maxSymbolValue; i++) {
+        printf("%u ", o0_cumul[i]);
+    }
+    printf("\n");
+    // print o1 cumul for symbol 254 for debugging
+    printf("O1 Cumul for symbol 32: it is o1used: %d\n", o1_use_or_not[32]);
+    for(int i = 0; i <= maxSymbolValue; i++) {
+        printf("%u ", o1_cumul[32][i]);
+    }
+    printf("\n");
+    printf("total count: %u\n", srcSize/symbollength);
     printf("RANS Table built. Starting compression...\n");
     while(current_id >= 0) {
         unsigned current_symbol = src_bytes[current_id];
@@ -481,3 +525,17 @@ size_t FSEO1_Compress(void* dst, size_t* dstSize,
                    const void* src, size_t srcSize) {
     return FSEO1_Compress2(dst, dstSize, src, srcSize, FSEO1_DEFAULT_MAX_SYMBOL_VALUE, FSEO1_DEFAULT_TABLELOG, FSEO1_DEFAULT_O0NUMCAP, FSEO1_DEFAULT_O1NUMCAP, 1);
 }
+
+
+// ababababa
+
+// a: 5
+// b: 4
+// 5/9 
+// b -> o0 
+// a -> o1 
+// a: b: 8 c: 1 d: 2
+// a -> 2^11 [B|C|D]
+// 
+
+// 
